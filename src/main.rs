@@ -6,7 +6,7 @@ use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::process::ExitCode;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 
@@ -171,6 +171,7 @@ fn dump_bytes<W: Write>(w: &mut W, prefix: &str, bytes: &[u8]) -> Result<(), std
     Ok(())
 }
 
+#[derive(Clone)]
 struct NetOptions {
     verbose: bool,
     close_quit: bool,
@@ -227,7 +228,7 @@ async fn tcp_txrx(
                         match cmd {
                             NetCmd::Send(bytes) => {
                                 if let Err(e) = stream.write_all(&bytes).await {
-                let _ = msg.send(NetMessage::Warning(format!(
+                    let _ = msg.send(NetMessage::Warning(format!(
                     "write failed: {}",e)))
                     .await;
                 }
@@ -352,6 +353,65 @@ async fn tcp_client(
     Ok(())
 }
 
+async fn udp_connection(
+    mut remote: Option<SocketAddr>,
+    bind: SocketAddr,
+    mut cmd: Receiver<NetCmd>,
+    msg: Sender<NetMessage>,
+    _net_options: NetOptions,
+) -> DynResult<()> {
+    let socket = UdpSocket::bind(bind).await?;
+    loop {
+        let mut buffer = [0u8; 1024];
+        tokio::select! {
+            ret = socket.recv_from(&mut buffer) => {
+                match ret {
+                    Ok((l, from)) => {
+
+            match remote {
+                Some(r) if r == from => {},
+                _ => {
+                let _ = msg.send(NetMessage::NewConnection(from)).await;
+                remote = Some(from);
+                }
+            }
+            let _ = msg.send(NetMessage::Data(buffer[..l].to_vec())).await;
+                    }
+                    Err(e) => {
+                        let _ = msg.send(NetMessage::Warning(format!("recv failed: {}",e)))
+                            .await;
+                    }
+                }
+            }
+            res = cmd.recv() => {
+                match res {
+                    Some(cmd) => {
+                        match cmd {
+                            NetCmd::Send(bytes) => {
+                if let Some(remote) = remote {
+                                    if let Err(e) = socket.send_to(&bytes, remote).await {
+                    let _ = msg.send(NetMessage::Warning(format!(
+                        "send failed: {}",e)))
+                        .await;
+                    }
+                } else {
+                    let _ = msg.send(NetMessage::Warning(
+                    "No destination address".to_string()))
+                    .await;
+                }
+                }
+                        }
+                    }
+                    None => {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Parser, Debug)]
 struct Args {
     /// Remote address to connect to
@@ -428,16 +488,33 @@ async fn main() -> ExitCode {
     let join: JoinHandle<DynResult<()>>;
     let (send_msg, mut recv_msg) = mpsc::channel(10);
     let (send_cmd, recv_cmd) = mpsc::channel(10);
-    if let Some(remote_socket) = remote_socket {
-        join = tokio::spawn(tcp_client(
-            remote_socket,
-            local_socket,
-            recv_cmd,
-            send_msg,
-            net_options,
-        ));
-    } else {
-        join = tokio::spawn(tcp_server(local_socket, recv_cmd, send_msg, net_options));
+    match (args.udp, remote_socket) {
+        (true, remote) => {
+            join = tokio::spawn(udp_connection(
+		remote,
+                local_socket,
+                recv_cmd,
+                send_msg,
+                net_options.clone(),
+            ));
+        }
+        (false, Some(remote_socket)) => {
+            join = tokio::spawn(tcp_client(
+                remote_socket,
+                local_socket,
+                recv_cmd,
+                send_msg,
+                net_options.clone(),
+            ));
+        }
+        (false, None) => {
+            join = tokio::spawn(tcp_server(
+                local_socket,
+                recv_cmd,
+                send_msg,
+                net_options.clone(),
+            ));
+        }
     }
     let (mut rl, mut out) = match Readline::new(">".to_string()) {
         Ok(res) => res,
@@ -522,7 +599,9 @@ async fn main() -> ExitCode {
             },
         }
     }
-    writeln!(out, "Exiting").unwrap();
+    if net_options.verbose {
+        writeln!(out, "Exiting").unwrap();
+    }
     rl.flush().unwrap();
     ExitCode::SUCCESS
 }
