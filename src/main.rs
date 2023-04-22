@@ -1,10 +1,12 @@
 use clap::Parser;
+use futures::future::FusedFuture;
+use futures::future::FutureExt as _;
 use rustyline_async::{Readline, ReadlineError};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::process::ExitCode;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 
@@ -89,10 +91,6 @@ mod parser {
 
     type ParseResult<'a, T> = IResult<&'a str, T, ParseError<'a>>;
 
-    fn from_hex(input: &str) -> Result<u8, std::num::ParseIntError> {
-        u8::from_str_radix(input, 16)
-    }
-
     fn hex_byte(input: &str) -> ParseResult<u8> {
         map_res(
             fold_many_m_n(
@@ -151,12 +149,12 @@ fn dump_bytes<W: Write>(w: &mut W, prefix: &str, bytes: &[u8]) -> Result<(), std
     for row in bytes.chunks(BYTES_PER_ROW) {
         write!(w, "{prefix}")?;
         for b in row {
-            write!(w, " {:02x}", b);
+            write!(w, " {:02x}", b)?;
         }
         for _ in row.len()..BYTES_PER_ROW {
-            write!(w, "   ");
+            write!(w, "   ")?;
         }
-        write!(w," ")?;
+        write!(w, " ")?;
         for b in row {
             write!(
                 w,
@@ -166,11 +164,17 @@ fn dump_bytes<W: Write>(w: &mut W, prefix: &str, bytes: &[u8]) -> Result<(), std
                 } else {
                     '.'
                 }
-            );
+            )?;
         }
-        writeln!(w, "");
+        writeln!(w, "")?;
     }
     Ok(())
+}
+
+struct NetOptions {
+    verbose: bool,
+    close_quit: bool,
+    reuse_addr: bool,
 }
 
 enum NetMessage {
@@ -186,71 +190,168 @@ enum NetCmd {
 
 type DynResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-async fn tcp_server(
-    bind: SocketAddr,
-    mut cmd: Receiver<NetCmd>,
-    msg: Sender<NetMessage>,
-) -> DynResult<()> {
-    let listener = TcpListener::bind(bind).await?;
-    let mut buffer = [0u8; 1024];
-    loop {
-        let ret = listener.accept().await;
-        let mut stream;
-        let remote;
+enum TerminationReason {
+    StreamClosed,
+    CmdDisconnected,
+}
 
-        match ret {
-            Ok((s, r)) => {
-                stream = s;
-                remote = r;
-                let _ = msg.send(NetMessage::NewConnection(r)).await;
-            }
-            Err(e) => {
-                let _ = msg
-                    .send(NetMessage::Warning(format!("accept failed: {}", e)))
-                    .await;
-                continue;
-            }
-        }
-        let mut running = true;
-        while running {
-            tokio::select! {
-                ret = stream.read(&mut buffer) => {
-                    match ret {
-                        Ok(l) => {
-                            if l > 0 {
-                                let _ = msg.send(NetMessage::Data(buffer[..l].to_vec())).await;
-                            } else {
-                                let _ = msg.send(NetMessage::Disconnected(remote)).await;
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = msg.send(NetMessage::Warning(format!("read failed: {}",e)))
-                                .await;
+async fn tcp_txrx(
+    stream: &mut TcpStream,
+    cmd: &mut Receiver<NetCmd>,
+    msg: &Sender<NetMessage>,
+    remote: &SocketAddr,
+    _net_options: &NetOptions,
+) -> DynResult<TerminationReason> {
+    loop {
+        let mut buffer = [0u8; 1024];
+        tokio::select! {
+            ret = stream.read(&mut buffer) => {
+                match ret {
+                    Ok(l) => {
+                        if l > 0 {
+                            let _ = msg.send(NetMessage::Data(buffer[..l].to_vec())).await;
+                        } else {
+                            let _ = msg.send(NetMessage::Disconnected(remote.clone())).await;
+                            return Ok(TerminationReason::StreamClosed);
                         }
                     }
+                    Err(e) => {
+                        let _ = msg.send(NetMessage::Warning(format!("read failed: {}",e)))
+                            .await;
+                    }
                 }
-                res = cmd.recv() => {
-                    match res {
-                        Some(cmd) => {
-                            match cmd {
-                                NetCmd::Send(bytes) => {
-                                    stream.write(&bytes).await;
-                                    stream.flush().await;
-                                }
+            }
+            res = cmd.recv() => {
+                match res {
+                    Some(cmd) => {
+                        match cmd {
+                            NetCmd::Send(bytes) => {
+                                if let Err(e) = stream.write_all(&bytes).await {
+                let _ = msg.send(NetMessage::Warning(format!(
+                    "write failed: {}",e)))
+                    .await;
+                }
                             }
                         }
-                        None => {
-                            running = false;
-                            break
-                        }
+                    }
+                    None => {
+                        return Ok(TerminationReason::CmdDisconnected);
                     }
                 }
             }
         }
     }
+}
+
+async fn tcp_server(
+    bind: SocketAddr,
+    mut cmd: Receiver<NetCmd>,
+    msg: Sender<NetMessage>,
+    net_options: NetOptions,
+) -> DynResult<()> {
+    let socket = match bind {
+        SocketAddr::V4(_) => TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => TcpSocket::new_v6()?,
+    };
+
+    socket.bind(bind)?;
+    socket.set_reuseaddr(net_options.reuse_addr)?;
+    let listener = socket.listen(2)?;
+    'accept: loop {
+        let accept = listener.accept();
+        tokio::pin!(accept);
+        let mut stream;
+        let remote;
+        loop {
+            tokio::select! {
+                ret = &mut accept => {
+
+                            match ret {
+                    Ok((s, r)) => {
+                        stream = s;
+                        remote = r;
+                        let _ = msg.send(NetMessage::NewConnection(r)).await;
+                break;
+                    }
+                    Err(e) => {
+                        let _ = msg
+                        .send(NetMessage::Warning(format!("accept failed: {}", e)))
+                        .await;
+                        continue;
+                    }
+                            }
+                }
+            res = cmd.recv() => {
+                        match res {
+                            Some(_) => {
+                    let _ = msg.send(NetMessage::Warning("Not connected!".to_string())).await;
+                }
+                            None => {
+                                break 'accept;
+                            }
+                        }
+            }
+            }
+        }
+        if let TerminationReason::CmdDisconnected =
+            tcp_txrx(&mut stream, &mut cmd, &msg, &remote, &net_options).await?
+        {
+            break;
+        }
+        if net_options.close_quit {
+            break;
+        }
+    }
     Ok(())
 }
+
+async fn tcp_client(
+    remote: SocketAddr,
+    local: SocketAddr,
+    mut cmd: Receiver<NetCmd>,
+    msg: Sender<NetMessage>,
+    net_options: NetOptions,
+) -> DynResult<()> {
+    'connect: loop {
+        let mut stream;
+        let socket = match remote {
+            SocketAddr::V4(_) => TcpSocket::new_v4()?,
+            SocketAddr::V6(_) => TcpSocket::new_v6()?,
+        };
+        socket.bind(local)?;
+        socket.set_reuseaddr(net_options.reuse_addr)?;
+        let connect = socket.connect(remote);
+        tokio::pin!(connect);
+        loop {
+            tokio::select! {
+                res = &mut connect => {
+            match res {
+                        Ok(s) => {
+                stream = s;
+                break;
+                },
+                Err(e) => return Err(format!("Connection failed: {e}").into())
+            }
+                }
+                res = cmd.recv() => {
+                    match res {
+                        Some(_) => {
+                let _ = msg.send(NetMessage::Warning("Not connected!".to_string())).await;
+                }
+                        None => {
+                            break 'connect;
+                            }
+                    }
+                }
+            }
+        }
+        let _ = msg.send(NetMessage::NewConnection(remote.clone())).await;
+        tcp_txrx(&mut stream, &mut cmd, &msg, &remote, &net_options).await?;
+        break 'connect;
+    }
+    Ok(())
+}
+
 #[derive(Parser, Debug)]
 struct Args {
     /// Remote address to connect to
@@ -283,7 +384,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
-    let _remote_socket = match (args.remote_addr, args.remote_port) {
+    let remote_socket = match (args.remote_addr, args.remote_port) {
         (Some(addr), Some(port)) => match (addr, args.ip_v6) {
             (IpAddr::V6(addr), true) => Some(SocketAddr::V6(SocketAddrV6::new(addr, port, 0, 0))),
             (IpAddr::V4(addr), false) => Some(SocketAddr::V4(SocketAddrV4::new(addr, port))),
@@ -318,10 +419,26 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    let net_options = NetOptions {
+        reuse_addr: args.reuse_addr,
+        verbose: args.verbose,
+        close_quit: args.close_quit,
+    };
     let join: JoinHandle<DynResult<()>>;
     let (send_msg, mut recv_msg) = mpsc::channel(10);
-    let (send_cmd, mut recv_cmd) = mpsc::channel(10);
-    join = tokio::spawn(tcp_server(local_socket, recv_cmd, send_msg));
+    let (send_cmd, recv_cmd) = mpsc::channel(10);
+    if let Some(remote_socket) = remote_socket {
+        join = tokio::spawn(tcp_client(
+            remote_socket,
+            local_socket,
+            recv_cmd,
+            send_msg,
+            net_options,
+        ));
+    } else {
+        join = tokio::spawn(tcp_server(local_socket, recv_cmd, send_msg, net_options));
+    }
     let (mut rl, mut out) = match Readline::new(">".to_string()) {
         Ok(res) => res,
         Err(e) => {
@@ -329,6 +446,8 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let join = join.fuse();
+    let mut net_task_result = None;
     rl.set_max_history(50);
     tokio::pin!(join);
     loop {
@@ -341,7 +460,7 @@ async fn main() -> ExitCode {
                         let res = parser::byte_values(&line);
                         match res {
                             Ok((_left, b)) => {
-                                dump_bytes(&mut out, "->", &b);
+                                dump_bytes(&mut out, "->", &b).unwrap();
                                 let _ = send_cmd.send(NetCmd::Send(b)).await;
                             }
                             Err(e) => {
@@ -360,17 +479,9 @@ async fn main() -> ExitCode {
                     },
                 }
             }
-            ret = &mut join => {
-                match ret {
-                    Err(e) => eprintln!("\nNetwork task faile"),
-                    Ok(res) => {
-                        match res {
-                            Ok(_) =>
-                                eprintln!("\nNetwork task exited"),
-                            Err(e) => eprintln!("\n{}", e),
-                        }
-                    }
-                }
+            res = &mut join => {
+        net_task_result = Some(res);
+
                 break;
             }
             res = recv_msg.recv() => {
@@ -378,14 +489,14 @@ async fn main() -> ExitCode {
                     Some(msg) => {
                         match msg {
                             NetMessage::NewConnection(socket) =>
-                                writeln!(out, "New connection from {}", socket).unwrap(),
+                                writeln!(out, "New connection to {}", socket).unwrap(),
                             NetMessage::Warning(w) =>
                                 writeln!(out, "Warning: {}", w).unwrap(),
                             NetMessage::Disconnected(socket) => {
                                 writeln!(out, "Disconnected from {}", socket).unwrap();
                             }
                             NetMessage::Data(bytes) => {
-                                dump_bytes(&mut out, "<-", &bytes);
+                                dump_bytes(&mut out, "<-", &bytes).unwrap();
                             }
                         }
                     }
@@ -397,6 +508,21 @@ async fn main() -> ExitCode {
             }
         }
     }
-    writeln!(out, "").unwrap();
+    rl.flush().unwrap();
+    drop(send_cmd);
+    if !join.is_terminated() {
+        net_task_result = Some(join.await);
+    }
+    if let Some(ret) = net_task_result {
+        match ret {
+            Err(e) => writeln!(out, "Network task failed: {e}").unwrap(),
+            Ok(res) => match res {
+                Ok(_) => {}
+                Err(e) => writeln!(out, "Network task failed: {}", e).unwrap(),
+            },
+        }
+    }
+    writeln!(out, "Exiting").unwrap();
+    rl.flush().unwrap();
     ExitCode::SUCCESS
 }

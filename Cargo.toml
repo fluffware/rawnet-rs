@@ -10,3 +10,4 @@ rustyline-async ="0.3"
 clap = { version = "4.2", features = ["derive"] }
 tokio= {version="1.27", features = ["sync","net", "macros", "rt-multi-thread", "io-util"]}
 nom ="7.1"
+futures="*"
