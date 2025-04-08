@@ -1,8 +1,7 @@
 use clap::Parser;
 use futures::future::FusedFuture;
 use futures::future::FutureExt as _;
-use rustyline_async::Readline;
-use rustyline_async::ReadlineEvent;
+use rustyline_async::{Readline, ReadlineEvent};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::process::ExitCode;
@@ -139,7 +138,7 @@ mod parser {
                     map(string, |v| v.as_bytes().to_vec()),
                 )),
             ),
-            || Vec::new(),
+            Vec::new,
             |mut v, mut b| {
                 v.append(&mut b);
                 v
@@ -171,7 +170,7 @@ fn dump_bytes<W: Write>(w: &mut W, prefix: &str, bytes: &[u8]) -> Result<(), std
                 }
             )?;
         }
-        writeln!(w, "")?;
+        writeln!(w)?;
     }
     Ok(())
 }
@@ -217,7 +216,7 @@ async fn tcp_txrx(
                         if l > 0 {
                             let _ = msg.send(NetMessage::Data(buffer[..l].to_vec())).await;
                         } else {
-                            let _ = msg.send(NetMessage::Disconnected(remote.clone())).await;
+                            let _ = msg.send(NetMessage::Disconnected(*remote)).await;
                             return Ok(TerminationReason::StreamClosed);
                         }
                     }
@@ -331,27 +330,27 @@ async fn tcp_client(
         loop {
             tokio::select! {
                 res = &mut connect => {
-            match res {
+		    match res {
                         Ok(s) => {
-                stream = s;
-                break;
-                },
-                Err(e) => return Err(format!("Connection failed: {e}").into())
-            }
+			    stream = s;
+			    break;
+			},
+			Err(e) => return Err(format!("Connection failed: {e}").into())
+		    }
                 }
                 res = cmd.recv() => {
                     match res {
                         Some(_) => {
-                let _ = msg.send(NetMessage::Warning("Not connected!".to_string())).await;
-                }
+			    let _ = msg.send(NetMessage::Warning("Not connected!".to_string())).await;
+			}
                         None => {
                             break 'connect;
-                            }
+                        }
                     }
                 }
             }
         }
-        let _ = msg.send(NetMessage::NewConnection(remote.clone())).await;
+        let _ = msg.send(NetMessage::NewConnection(remote)).await;
         tcp_txrx(&mut stream, &mut cmd, &msg, &remote, &net_options).await?;
         break 'connect;
     }
@@ -539,7 +538,7 @@ async fn main() -> ExitCode {
                     Ok(ReadlineEvent::Line(line)) => {
                         let line = line.trim();
                         rl.add_history_entry(line.to_string());
-                        let res = parser::byte_values(&line);
+                        let res = parser::byte_values(line);
                         match res {
                             Ok((_left, b)) => {
                                 dump_bytes(&mut out, "->", &b).unwrap();
@@ -550,15 +549,11 @@ async fn main() -> ExitCode {
                             }
                         }
                     }
-                    Ok(ReadlineEvent::Eof) => {
-                        break;
-                    }
-                    Ok(ReadlineEvent::Interrupted) => {
-                        break;
-                    }
+                    Ok(ReadlineEvent::Eof) => break,
+                    Ok(ReadlineEvent::Interrupted) => break,
                     Err(e) => {
-                            eprintln!("Readline::readline failed: {}", e);
-                            return ExitCode::FAILURE;
+                        eprintln!("Readline::readline failed: {}", e);
+                        return ExitCode::FAILURE;
 
                     },
                 }
