@@ -1,7 +1,8 @@
 use clap::Parser;
 use futures::future::FusedFuture;
 use futures::future::FutureExt as _;
-use rustyline_async::{Readline, ReadlineError};
+use rustyline_async::Readline;
+use rustyline_async::ReadlineEvent;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::process::ExitCode;
@@ -19,6 +20,7 @@ mod parser {
     use nom::multi::{fold_many0, fold_many_m_n};
     use nom::sequence::{delimited, preceded};
     use nom::IResult;
+    use nom::Parser;
     use std::fmt::{self, Display, Formatter};
     use std::num::ParseIntError;
 
@@ -107,7 +109,8 @@ mod parser {
                     Ok(v as u8)
                 }
             },
-        )(input)
+        )
+        .parse(input)
     }
 
     fn string(input: &str) -> ParseResult<String> {
@@ -123,7 +126,8 @@ mod parser {
                 )),
             ),
             complete::char('"'),
-        )(input)
+        )
+        .parse(input)
     }
 
     pub fn byte_values(input: &str) -> ParseResult<Vec<u8>> {
@@ -140,7 +144,8 @@ mod parser {
                 v.append(&mut b);
                 v
             },
-        )(input)
+        )
+        .parse(input)
     }
 }
 
@@ -491,7 +496,7 @@ async fn main() -> ExitCode {
     match (args.udp, remote_socket) {
         (true, remote) => {
             join = tokio::spawn(udp_connection(
-		remote,
+                remote,
                 local_socket,
                 recv_cmd,
                 send_msg,
@@ -531,7 +536,7 @@ async fn main() -> ExitCode {
         tokio::select! {
             ret = rl.readline() => {
                 match ret {
-                    Ok(line) => {
+                    Ok(ReadlineEvent::Line(line)) => {
                         let line = line.trim();
                         rl.add_history_entry(line.to_string());
                         let res = parser::byte_values(&line);
@@ -545,14 +550,16 @@ async fn main() -> ExitCode {
                             }
                         }
                     }
-                    Err(e) => match e {
-                        ReadlineError::Eof => {
-                            break;
-                        }
-                        e => {
+                    Ok(ReadlineEvent::Eof) => {
+                        break;
+                    }
+                    Ok(ReadlineEvent::Interrupted) => {
+                        break;
+                    }
+                    Err(e) => {
                             eprintln!("Readline::readline failed: {}", e);
                             return ExitCode::FAILURE;
-                        }
+
                     },
                 }
             }
